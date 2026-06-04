@@ -1,408 +1,376 @@
-import { useRef, useCallback, useEffect } from 'react'
+import { useRef, useEffect, useCallback } from 'react'
 import { useDashboardStore } from '@/store/dashboardStore'
-import type { RuViewFrame, NodePosition } from '@/types/ruview'
+import type { RuViewFrame, LayerVisibility, DashboardSettings, NodePosition } from '@/types/ruview'
 
-type DragState = {
-  active: boolean
-  nodeId: number
-  startCanvasX: number
-  startCanvasY: number
-  startRoomX: number
-  startRoomY: number
-}
-
-type UseFloorMapOptions = {
-  canvasRef: React.RefObject<HTMLCanvasElement | null>
-}
-
+// ─── Constants ───────────────────────────────────────────────────────────────
 const PADDING = 32
 const NODE_RADIUS = 10
 const PERSON_RADIUS = 12
-const HEATMAP_ALPHA_MAX = 0.7
-
-// Heatmap grid dimensions
+const HEATMAP_ALPHA_MAX = 0.65
 const GRID_COLS = 20
 const GRID_ROWS = 20
 
+// Person position EMA: α=0.08 → ~0.4s smoothing at 34fps (responsive but smooth)
+const PERSON_POS_ALPHA = 0.08
+// Person is shown faded until it has been tracked for this long
+const PERSON_FADE_IN_MS = 600
+// Person stays visible for this long after last frame mention
+const PERSON_LINGER_MS = 2500
+
+// ─── Coordinate helpers ──────────────────────────────────────────────────────
 function roomToCanvas(
-  roomX: number,
-  roomY: number,
-  roomWidth: number,
-  roomDepth: number,
-  canvasW: number,
-  canvasH: number
+  rx: number, ry: number,
+  roomW: number, roomD: number,
+  canvasW: number, canvasH: number
 ): [number, number] {
-  const drawW = canvasW - PADDING * 2
-  const drawH = canvasH - PADDING * 2
-  return [
-    PADDING + (roomX / roomWidth) * drawW,
-    PADDING + (roomY / roomDepth) * drawH,
-  ]
+  const dw = canvasW - PADDING * 2
+  const dh = canvasH - PADDING * 2
+  return [PADDING + (rx / roomW) * dw, PADDING + (ry / roomD) * dh]
 }
 
 function canvasToRoom(
-  cx: number,
-  cy: number,
-  roomWidth: number,
-  roomDepth: number,
-  canvasW: number,
-  canvasH: number
+  cx: number, cy: number,
+  roomW: number, roomD: number,
+  canvasW: number, canvasH: number
 ): NodePosition {
-  const drawW = canvasW - PADDING * 2
-  const drawH = canvasH - PADDING * 2
+  const dw = canvasW - PADDING * 2
+  const dh = canvasH - PADDING * 2
   return {
-    x: Math.max(0, Math.min(roomWidth, ((cx - PADDING) / drawW) * roomWidth)),
-    y: Math.max(0, Math.min(roomDepth, ((cy - PADDING) / drawH) * roomDepth)),
+    x: Math.max(0, Math.min(roomW, ((cx - PADDING) / dw) * roomW)),
+    y: Math.max(0, Math.min(roomD, ((cy - PADDING) / dh) * roomD)),
   }
 }
 
-function getDefaultNodePosition(
-  nodeId: number,
-  totalNodes: number,
-  roomWidth: number
-): NodePosition {
-  // Spread nodes evenly across the top edge by default
-  const step = roomWidth / (totalNodes + 1)
-  return { x: step * (nodeId + 1), y: 0.3 }
+function defaultNodePos(nodeId: number, roomW: number, roomD: number): NodePosition {
+  // Triangle formation in corners by default
+  const positions: Record<number, NodePosition> = {
+    1: { x: roomW * 0.1, y: roomD * 0.1 },
+    2: { x: roomW * 0.9, y: roomD * 0.1 },
+    3: { x: roomW * 0.5, y: roomD * 0.9 },
+  }
+  return positions[nodeId] ?? { x: roomW * 0.5, y: roomD * 0.5 }
 }
 
+// ─── Tracked person state ────────────────────────────────────────────────────
+type TrackedPerson = {
+  cx: number
+  cy: number
+  firstSeenAt: number
+  lastSeenAt: number
+  confidence: number
+}
+
+// ─── Hook ────────────────────────────────────────────────────────────────────
+type UseFloorMapOptions = { canvasRef: React.RefObject<HTMLCanvasElement | null> }
+
 export function useFloorMap({ canvasRef }: UseFloorMapOptions) {
-  const dragRef = useRef<DragState>({
-    active: false,
-    nodeId: -1,
-    startCanvasX: 0,
-    startCanvasY: 0,
-    startRoomX: 0,
-    startRoomY: 0,
-  })
+  // ── Mirror store values into refs (no deps in RAF loop) ──────────────────
+  const frameRef = useRef<RuViewFrame | null>(null)
+  const layersRef = useRef<LayerVisibility>({ heatmap: true, persons: true, nodes: true, trajectory: true })
+  const settingsRef = useRef<DashboardSettings>({ wsUrl: '', roomWidth: 6, roomDepth: 4, nodePositions: {} })
 
-  const { settings, layers, latestFrame, updateNodePosition } = useDashboardStore()
-  const { roomWidth, roomDepth, nodePositions } = settings
+  const frame = useDashboardStore((s) => s.latestFrame)
+  const layers = useDashboardStore((s) => s.layers)
+  const settings = useDashboardStore((s) => s.settings)
+  const updateNodePosition = useDashboardStore((s) => s.updateNodePosition)
 
-  const draw = useCallback(
-    (frame: RuViewFrame | null) => {
-      const canvas = canvasRef.current
-      if (!canvas) return
-      const ctx = canvas.getContext('2d')
-      if (!ctx) return
+  // Sync to refs every render — O(1), no re-render triggered
+  frameRef.current = frame
+  layersRef.current = layers
+  settingsRef.current = settings
 
-      const W = canvas.width
-      const H = canvas.height
-      const drawW = W - PADDING * 2
-      const drawH = H - PADDING * 2
+  // ── Person tracking (EMA smoothed positions) ─────────────────────────────
+  const trackedPersons = useRef<Map<number, TrackedPerson>>(new Map())
 
-      // Clear
-      ctx.clearRect(0, 0, W, H)
+  // ── Heatmap smoothing (per-cell EMA) ─────────────────────────────────────
+  const heatmapEma = useRef<Float32Array>(new Float32Array(GRID_COLS * GRID_ROWS))
+  const HEATMAP_ALPHA = 0.06
 
-      // Room background
-      ctx.fillStyle = 'rgba(15, 17, 23, 0.9)'
-      ctx.fillRect(PADDING, PADDING, drawW, drawH)
+  // ── Drag state ───────────────────────────────────────────────────────────
+  const dragRef = useRef({ active: false, nodeId: -1 })
 
-      // Grid lines
-      ctx.strokeStyle = 'rgba(255,255,255,0.04)'
-      ctx.lineWidth = 1
-      const gridStepX = drawW / roomWidth
-      const gridStepY = drawH / roomDepth
-      for (let x = 0; x <= roomWidth; x++) {
-        const cx = PADDING + x * gridStepX
-        ctx.beginPath()
-        ctx.moveTo(cx, PADDING)
-        ctx.lineTo(cx, PADDING + drawH)
-        ctx.stroke()
-      }
-      for (let y = 0; y <= roomDepth; y++) {
-        const cy = PADDING + y * gridStepY
-        ctx.beginPath()
-        ctx.moveTo(PADDING, cy)
-        ctx.lineTo(PADDING + drawW, cy)
-        ctx.stroke()
-      }
+  // ── Draw function assigned to ref (called from RAF, reads current refs) ──
+  const drawRef = useRef(() => {})
+  drawRef.current = () => {
+    const canvas = canvasRef.current
+    if (!canvas) return
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return
 
-      // Room border
-      ctx.strokeStyle = 'rgba(6, 182, 212, 0.3)'
-      ctx.lineWidth = 1.5
-      ctx.strokeRect(PADDING, PADDING, drawW, drawH)
+    const W = canvas.width
+    const H = canvas.height
+    if (W === 0 || H === 0) return
+    const dw = W - PADDING * 2
+    const dh = H - PADDING * 2
 
-      // Dimension labels
-      ctx.fillStyle = 'rgba(100,120,140,0.7)'
-      ctx.font = '11px monospace'
-      ctx.textAlign = 'center'
-      ctx.fillText(`${roomWidth}m`, PADDING + drawW / 2, PADDING - 10)
-      ctx.textAlign = 'left'
-      ctx.save()
-      ctx.translate(PADDING - 12, PADDING + drawH / 2)
-      ctx.rotate(-Math.PI / 2)
-      ctx.textAlign = 'center'
-      ctx.fillText(`${roomDepth}m`, 0, 0)
-      ctx.restore()
+    const { roomWidth: rW, roomDepth: rD, nodePositions } = settingsRef.current
+    const layers = layersRef.current
+    const frame = frameRef.current
+    const now = Date.now()
 
-      // Heatmap layer
-      if (layers.heatmap && frame && frame.signal_field.values.length > 0) {
-        const values = frame.signal_field.values
-        const [gW, gH] = [GRID_COLS, GRID_ROWS]
-        const cellW = drawW / gW
-        const cellH = drawH / gH
-
-        let maxVal = 0
-        for (const v of values) {
-          if (v > maxVal) maxVal = v
-        }
-        if (maxVal === 0) maxVal = 1
-
-        for (let row = 0; row < gH; row++) {
-          for (let col = 0; col < gW; col++) {
-            const idx = row * gW + col
-            const raw = values[idx] ?? 0
-            const normalized = Math.min(1, raw / maxVal)
-            if (normalized < 0.05) continue
-
-            const alpha = normalized * HEATMAP_ALPHA_MAX
-            // Cyan gradient: low = teal, high = bright cyan
-            const r = Math.round(6 + normalized * 22)
-            const g = Math.round(182 - normalized * 40)
-            const b = Math.round(212)
-
-            ctx.fillStyle = `rgba(${r},${g},${b},${alpha})`
-            ctx.fillRect(
-              PADDING + col * cellW,
-              PADDING + row * cellH,
-              cellW,
-              cellH
-            )
-          }
+    // ── Update heatmap EMA ─────────────────────────────────────────────────
+    if (frame?.signal_field.values.length) {
+      const vals = frame.signal_field.values
+      let maxRaw = 0
+      for (const v of vals) if (v > maxRaw) maxRaw = v
+      if (maxRaw > 0) {
+        for (let i = 0; i < heatmapEma.current.length; i++) {
+          const norm = Math.min(1, (vals[i] ?? 0) / maxRaw)
+          heatmapEma.current[i] = HEATMAP_ALPHA * norm + (1 - HEATMAP_ALPHA) * (heatmapEma.current[i] ?? 0)
         }
       }
+    }
 
-      // Node markers
-      if (layers.nodes && frame) {
-        const allNodeIds = frame.nodes.map((n) => n.node_id)
-        const totalNodes = Math.max(allNodeIds.length, 1)
+    // ── Update tracked persons ─────────────────────────────────────────────
+    if (frame?.persons) {
+      const seenIds = new Set<number>()
 
-        for (const node of frame.nodes) {
-          const savedPos = nodePositions[node.node_id]
-          const pos: NodePosition =
-            savedPos ?? getDefaultNodePosition(node.node_id, totalNodes, roomWidth)
+      for (const person of frame.persons) {
+        seenIds.add(person.id)
 
-          const [cx, cy] = roomToCanvas(pos.x, pos.y, roomWidth, roomDepth, W, H)
+        // Compute raw canvas position from keypoints
+        const leftHip = person.keypoints.find((k) => k.name === 'left_hip')
+        const rightHip = person.keypoints.find((k) => k.name === 'right_hip')
 
-          // Glow
-          const grd = ctx.createRadialGradient(cx, cy, 2, cx, cy, NODE_RADIUS * 2.5)
-          grd.addColorStop(0, 'rgba(6,182,212,0.4)')
-          grd.addColorStop(1, 'rgba(6,182,212,0)')
-          ctx.fillStyle = grd
-          ctx.beginPath()
-          ctx.arc(cx, cy, NODE_RADIUS * 2.5, 0, Math.PI * 2)
-          ctx.fill()
+        let rawCx: number
+        let rawCy: number
 
-          // Diamond shape
-          ctx.save()
-          ctx.translate(cx, cy)
-          ctx.rotate(Math.PI / 4)
-          ctx.fillStyle = '#06b6d4'
-          ctx.fillRect(-NODE_RADIUS / 2, -NODE_RADIUS / 2, NODE_RADIUS, NODE_RADIUS)
-          ctx.restore()
+        if (leftHip && rightHip && leftHip.confidence > 0.1 && rightHip.confidence > 0.1) {
+          rawCx = PADDING + ((leftHip.x + rightHip.x) / 2 / 480) * dw
+          rawCy = PADDING + ((leftHip.y + rightHip.y) / 2 / 640) * dh
+        } else {
+          const valid = person.keypoints.filter((k) => k.confidence > 0.1)
+          if (valid.length === 0) continue
+          rawCx = PADDING + (valid.reduce((s, k) => s + k.x, 0) / valid.length / 480) * dw
+          rawCy = PADDING + (valid.reduce((s, k) => s + k.y, 0) / valid.length / 640) * dh
+        }
 
-          // Border circle
-          ctx.strokeStyle = '#06b6d4'
-          ctx.lineWidth = 1.5
-          ctx.beginPath()
-          ctx.arc(cx, cy, NODE_RADIUS, 0, Math.PI * 2)
-          ctx.stroke()
+        const prev = trackedPersons.current.get(person.id)
+        trackedPersons.current.set(person.id, {
+          cx: prev ? PERSON_POS_ALPHA * rawCx + (1 - PERSON_POS_ALPHA) * prev.cx : rawCx,
+          cy: prev ? PERSON_POS_ALPHA * rawCy + (1 - PERSON_POS_ALPHA) * prev.cy : rawCy,
+          firstSeenAt: prev?.firstSeenAt ?? now,
+          lastSeenAt: now,
+          confidence: PERSON_POS_ALPHA * person.confidence + (1 - PERSON_POS_ALPHA) * (prev?.confidence ?? person.confidence),
+        })
+      }
 
-          // RSSI label
-          ctx.fillStyle = '#22d3ee'
-          ctx.font = 'bold 10px monospace'
-          ctx.textAlign = 'center'
-          ctx.fillText(`N${node.node_id}`, cx, cy + NODE_RADIUS + 12)
-          ctx.fillStyle = 'rgba(100,200,220,0.6)'
+      // Remove persons not seen for PERSON_LINGER_MS
+      for (const [id, p] of trackedPersons.current) {
+        if (now - p.lastSeenAt > PERSON_LINGER_MS) trackedPersons.current.delete(id)
+      }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // DRAW
+    // ─────────────────────────────────────────────────────────────────────────
+
+    ctx.clearRect(0, 0, W, H)
+
+    // Room background
+    ctx.fillStyle = 'rgba(10, 12, 18, 0.95)'
+    ctx.fillRect(PADDING, PADDING, dw, dh)
+
+    // Grid lines
+    ctx.strokeStyle = 'rgba(255,255,255,0.035)'
+    ctx.lineWidth = 1
+    for (let x = 0; x <= rW; x++) {
+      const cx = PADDING + (x / rW) * dw
+      ctx.beginPath(); ctx.moveTo(cx, PADDING); ctx.lineTo(cx, PADDING + dh); ctx.stroke()
+    }
+    for (let y = 0; y <= rD; y++) {
+      const cy = PADDING + (y / rD) * dh
+      ctx.beginPath(); ctx.moveTo(PADDING, cy); ctx.lineTo(PADDING + dw, cy); ctx.stroke()
+    }
+
+    // Room border
+    ctx.strokeStyle = 'rgba(6,182,212,0.25)'
+    ctx.lineWidth = 1.5
+    ctx.strokeRect(PADDING, PADDING, dw, dh)
+
+    // Dimension labels
+    ctx.fillStyle = 'rgba(100,160,180,0.5)'
+    ctx.font = '11px monospace'
+    ctx.textAlign = 'center'
+    ctx.fillText(`${rW} m`, PADDING + dw / 2, PADDING - 10)
+    ctx.save()
+    ctx.translate(PADDING - 14, PADDING + dh / 2)
+    ctx.rotate(-Math.PI / 2)
+    ctx.textAlign = 'center'
+    ctx.fillText(`${rD} m`, 0, 0)
+    ctx.restore()
+
+    // ── Heatmap ────────────────────────────────────────────────────────────
+    if (layers.heatmap) {
+      const cellW = dw / GRID_COLS
+      const cellH = dh / GRID_ROWS
+      for (let row = 0; row < GRID_ROWS; row++) {
+        for (let col = 0; col < GRID_COLS; col++) {
+          const v = heatmapEma.current[row * GRID_COLS + col] ?? 0
+          if (v < 0.04) continue
+          const alpha = v * HEATMAP_ALPHA_MAX
+          const g = Math.round(182 - v * 50)
+          ctx.fillStyle = `rgba(6,${g},212,${alpha})`
+          ctx.fillRect(PADDING + col * cellW, PADDING + row * cellH, cellW, cellH)
+        }
+      }
+    }
+
+    // ── Node markers ───────────────────────────────────────────────────────
+    if (layers.nodes) {
+      // Determine which node IDs to show: from frame if available, else 1-3
+      const nodeIds: number[] = frame?.nodes.map((n) => n.node_id) ?? [1, 2, 3]
+
+      for (const nodeId of nodeIds) {
+        const pos = nodePositions[nodeId] ?? defaultNodePos(nodeId, rW, rD)
+        const [cx, cy] = roomToCanvas(pos.x, pos.y, rW, rD, W, H)
+
+        // Glow
+        const grd = ctx.createRadialGradient(cx, cy, 2, cx, cy, NODE_RADIUS * 2.8)
+        grd.addColorStop(0, 'rgba(6,182,212,0.35)')
+        grd.addColorStop(1, 'rgba(6,182,212,0)')
+        ctx.fillStyle = grd
+        ctx.beginPath()
+        ctx.arc(cx, cy, NODE_RADIUS * 2.8, 0, Math.PI * 2)
+        ctx.fill()
+
+        // Diamond
+        ctx.save()
+        ctx.translate(cx, cy)
+        ctx.rotate(Math.PI / 4)
+        ctx.fillStyle = '#06b6d4'
+        ctx.fillRect(-NODE_RADIUS / 2, -NODE_RADIUS / 2, NODE_RADIUS, NODE_RADIUS)
+        ctx.restore()
+
+        // Ring
+        ctx.strokeStyle = '#06b6d4'
+        ctx.lineWidth = 1.5
+        ctx.beginPath()
+        ctx.arc(cx, cy, NODE_RADIUS, 0, Math.PI * 2)
+        ctx.stroke()
+
+        // Label
+        ctx.fillStyle = '#22d3ee'
+        ctx.font = 'bold 10px monospace'
+        ctx.textAlign = 'center'
+        ctx.fillText(`N${nodeId}`, cx, cy + NODE_RADIUS + 13)
+
+        // RSSI from frame if available
+        const frameNode = frame?.nodes.find((n) => n.node_id === nodeId)
+        if (frameNode) {
+          ctx.fillStyle = 'rgba(100,200,220,0.55)'
           ctx.font = '9px monospace'
-          ctx.fillText(`${node.rssi_dbm}dBm`, cx, cy + NODE_RADIUS + 22)
+          ctx.fillText(`${frameNode.rssi_dbm.toFixed(0)} dBm`, cx, cy + NODE_RADIUS + 23)
         }
       }
+    }
 
-      // Persons layer
-      if (layers.persons && frame && frame.persons.length > 0) {
-        const now = Date.now()
+    // ── Persons (smoothed positions) ───────────────────────────────────────
+    if (layers.persons) {
+      for (const [, p] of trackedPersons.current) {
+        const age = now - p.firstSeenAt
+        const staleness = now - p.lastSeenAt
+        // Fade in
+        const fadeIn = Math.min(1, age / PERSON_FADE_IN_MS)
+        // Fade out when not seen recently
+        const fadeOut = staleness > 1000 ? Math.max(0, 1 - (staleness - 1000) / (PERSON_LINGER_MS - 1000)) : 1
+        const opacity = fadeIn * fadeOut * Math.max(0.35, p.confidence)
 
-        for (const person of frame.persons) {
-          // Find hip keypoints
-          const leftHip = person.keypoints.find((k) => k.name === 'left_hip')
-          const rightHip = person.keypoints.find((k) => k.name === 'right_hip')
+        if (opacity < 0.05) continue
 
-          let personCanvasX: number
-          let personCanvasY: number
+        // Animated pulse ring
+        const pulse = (Math.sin(now / 700) + 1) / 2
+        const ringR = PERSON_RADIUS + pulse * 10
 
-          if (leftHip && rightHip && leftHip.confidence > 0.1 && rightHip.confidence > 0.1) {
-            const midX = (leftHip.x + rightHip.x) / 2
-            const midY = (leftHip.y + rightHip.y) / 2
-            // Map from model space (480×640) to canvas
-            personCanvasX = PADDING + (midX / 480) * drawW
-            personCanvasY = PADDING + (midY / 640) * drawH
-          } else if (person.keypoints.length > 0) {
-            // Fallback: centroid of all keypoints with decent confidence
-            const valid = person.keypoints.filter((k) => k.confidence > 0.1)
-            if (valid.length === 0) continue
-            const sumX = valid.reduce((s, k) => s + k.x, 0)
-            const sumY = valid.reduce((s, k) => s + k.y, 0)
-            personCanvasX = PADDING + (sumX / valid.length / 480) * drawW
-            personCanvasY = PADDING + (sumY / valid.length / 640) * drawH
-          } else {
-            // Use bbox center
-            personCanvasX = PADDING + ((person.bbox.x + person.bbox.width / 2) / 480) * drawW
-            personCanvasY = PADDING + ((person.bbox.y + person.bbox.height / 2) / 640) * drawH
-          }
+        ctx.strokeStyle = `rgba(6,182,212,${opacity * 0.35})`
+        ctx.lineWidth = 1
+        ctx.beginPath()
+        ctx.arc(p.cx, p.cy, ringR, 0, Math.PI * 2)
+        ctx.stroke()
 
-          const opacity = Math.max(0.3, person.confidence)
+        // Person fill
+        ctx.fillStyle = `rgba(6,182,212,${opacity * 0.2})`
+        ctx.beginPath()
+        ctx.arc(p.cx, p.cy, PERSON_RADIUS, 0, Math.PI * 2)
+        ctx.fill()
 
-          // Pulse rings (CSS animation not available on canvas, use time-based)
-          const pulse = (Math.sin(now / 600 + person.id) + 1) / 2
-          const ringRadius = PERSON_RADIUS + pulse * 12
+        ctx.strokeStyle = `rgba(6,182,212,${opacity})`
+        ctx.lineWidth = 2
+        ctx.beginPath()
+        ctx.arc(p.cx, p.cy, PERSON_RADIUS, 0, Math.PI * 2)
+        ctx.stroke()
 
-          ctx.strokeStyle = `rgba(6, 182, 212, ${opacity * 0.4})`
-          ctx.lineWidth = 1
-          ctx.beginPath()
-          ctx.arc(personCanvasX, personCanvasY, ringRadius, 0, Math.PI * 2)
-          ctx.stroke()
-
-          // Person circle
-          ctx.fillStyle = `rgba(6, 182, 212, ${opacity * 0.25})`
-          ctx.beginPath()
-          ctx.arc(personCanvasX, personCanvasY, PERSON_RADIUS, 0, Math.PI * 2)
-          ctx.fill()
-
-          ctx.strokeStyle = `rgba(6, 182, 212, ${opacity})`
-          ctx.lineWidth = 2
-          ctx.beginPath()
-          ctx.arc(personCanvasX, personCanvasY, PERSON_RADIUS, 0, Math.PI * 2)
-          ctx.stroke()
-
-          // Person ID
-          ctx.fillStyle = `rgba(255,255,255,${opacity})`
-          ctx.font = 'bold 10px monospace'
-          ctx.textAlign = 'center'
-          ctx.fillText(`P${person.id}`, personCanvasX, personCanvasY + 4)
-
-          // Zone label below
-          if (person.zone) {
-            ctx.fillStyle = `rgba(100,200,220,${opacity * 0.7})`
-            ctx.font = '9px monospace'
-            ctx.fillText(person.zone, personCanvasX, personCanvasY + PERSON_RADIUS + 12)
-          }
-        }
+        // Person icon
+        ctx.fillStyle = `rgba(255,255,255,${opacity * 0.9})`
+        ctx.font = 'bold 10px monospace'
+        ctx.textAlign = 'center'
+        ctx.fillText('●', p.cx, p.cy + 4)
       }
+    }
 
-      ctx.textAlign = 'left'
-    },
-    [canvasRef, layers, roomWidth, roomDepth, nodePositions]
-  )
+    ctx.textAlign = 'left'
+  }
 
-  // Animation loop
-  const animFrameRef = useRef<number>(0)
-  const latestFrameRef = useRef<RuViewFrame | null>(null)
-  latestFrameRef.current = latestFrame
-
+  // ── Single stable RAF loop — empty deps, never restarts ─────────────────
   useEffect(() => {
-    let running = true
+    let raf = 0
     const loop = () => {
-      if (!running) return
-      draw(latestFrameRef.current)
-      animFrameRef.current = requestAnimationFrame(loop)
+      drawRef.current()
+      raf = requestAnimationFrame(loop)
     }
-    animFrameRef.current = requestAnimationFrame(loop)
-    return () => {
-      running = false
-      cancelAnimationFrame(animFrameRef.current)
+    raf = requestAnimationFrame(loop)
+    return () => cancelAnimationFrame(raf)
+  }, []) // ← intentionally empty: loop runs once forever
+
+  // ── Drag: find node at canvas coords ────────────────────────────────────
+  const getNodeAt = useCallback((cx: number, cy: number): number | null => {
+    const canvas = canvasRef.current
+    if (!canvas) return null
+    const { roomWidth: rW, roomDepth: rD, nodePositions } = settingsRef.current
+    const W = canvas.width
+    const H = canvas.height
+    const nodeIds = frameRef.current?.nodes.map((n) => n.node_id) ?? [1, 2, 3]
+
+    for (const nodeId of nodeIds) {
+      const pos = nodePositions[nodeId] ?? defaultNodePos(nodeId, rW, rD)
+      const [ncx, ncy] = roomToCanvas(pos.x, pos.y, rW, rD, W, H)
+      if (Math.hypot(cx - ncx, cy - ncy) < NODE_RADIUS + 10) return nodeId
     }
-  }, [draw])
+    return null
+  }, [canvasRef])
 
-  // Drag handlers
-  const getNodeAtCanvas = useCallback(
-    (cx: number, cy: number): number | null => {
-      if (!latestFrameRef.current) return null
-      const canvas = canvasRef.current
-      if (!canvas) return null
-      const W = canvas.width
-      const H = canvas.height
-      const frame = latestFrameRef.current
-      const totalNodes = frame.nodes.length
+  const onMouseDown = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+    const canvas = canvasRef.current
+    if (!canvas) return
+    const rect = canvas.getBoundingClientRect()
+    const cx = (e.clientX - rect.left) * (canvas.width / rect.width)
+    const cy = (e.clientY - rect.top) * (canvas.height / rect.height)
+    const nodeId = getNodeAt(cx, cy)
+    if (nodeId === null) return
+    dragRef.current = { active: true, nodeId }
+    canvas.style.cursor = 'grabbing'
+  }, [canvasRef, getNodeAt])
 
-      for (const node of frame.nodes) {
-        const savedPos = nodePositions[node.node_id]
-        const pos =
-          savedPos ?? getDefaultNodePosition(node.node_id, totalNodes, roomWidth)
-        const [ncx, ncy] = roomToCanvas(pos.x, pos.y, roomWidth, roomDepth, W, H)
-        const dist = Math.hypot(cx - ncx, cy - ncy)
-        if (dist < NODE_RADIUS + 8) return node.node_id
-      }
-      return null
-    },
-    [canvasRef, nodePositions, roomWidth, roomDepth]
-  )
+  const onMouseMove = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+    const canvas = canvasRef.current
+    if (!canvas) return
+    const rect = canvas.getBoundingClientRect()
+    const cx = (e.clientX - rect.left) * (canvas.width / rect.width)
+    const cy = (e.clientY - rect.top) * (canvas.height / rect.height)
 
-  const onMouseDown = useCallback(
-    (e: React.MouseEvent<HTMLCanvasElement>) => {
-      const canvas = canvasRef.current
-      if (!canvas) return
-      const rect = canvas.getBoundingClientRect()
-      const scaleX = canvas.width / rect.width
-      const scaleY = canvas.height / rect.height
-      const cx = (e.clientX - rect.left) * scaleX
-      const cy = (e.clientY - rect.top) * scaleY
+    if (!dragRef.current.active) {
+      canvas.style.cursor = getNodeAt(cx, cy) !== null ? 'grab' : 'default'
+      return
+    }
 
-      const nodeId = getNodeAtCanvas(cx, cy)
-      if (nodeId === null) return
-
-      const frame = latestFrameRef.current
-      if (!frame) return
-      const totalNodes = frame.nodes.length
-      const savedPos = nodePositions[nodeId]
-      const pos = savedPos ?? getDefaultNodePosition(nodeId, totalNodes, roomWidth)
-
-      dragRef.current = {
-        active: true,
-        nodeId,
-        startCanvasX: cx,
-        startCanvasY: cy,
-        startRoomX: pos.x,
-        startRoomY: pos.y,
-      }
-      canvas.style.cursor = 'grabbing'
-    },
-    [canvasRef, getNodeAtCanvas, nodePositions, roomWidth, roomDepth]
-  )
-
-  const onMouseMove = useCallback(
-    (e: React.MouseEvent<HTMLCanvasElement>) => {
-      const canvas = canvasRef.current
-      if (!canvas) return
-
-      if (!dragRef.current.active) {
-        const rect = canvas.getBoundingClientRect()
-        const scaleX = canvas.width / rect.width
-        const scaleY = canvas.height / rect.height
-        const cx = (e.clientX - rect.left) * scaleX
-        const cy = (e.clientY - rect.top) * scaleY
-        const hit = getNodeAtCanvas(cx, cy)
-        canvas.style.cursor = hit !== null ? 'grab' : 'default'
-        return
-      }
-
-      const rect = canvas.getBoundingClientRect()
-      const scaleX = canvas.width / rect.width
-      const scaleY = canvas.height / rect.height
-      const cx = (e.clientX - rect.left) * scaleX
-      const cy = (e.clientY - rect.top) * scaleY
-
-      const newPos = canvasToRoom(cx, cy, roomWidth, roomDepth, canvas.width, canvas.height)
-      updateNodePosition(dragRef.current.nodeId, newPos)
-    },
-    [canvasRef, getNodeAtCanvas, roomWidth, roomDepth, updateNodePosition]
-  )
+    const { roomWidth: rW, roomDepth: rD } = settingsRef.current
+    const newPos = canvasToRoom(cx, cy, rW, rD, canvas.width, canvas.height)
+    updateNodePosition(dragRef.current.nodeId, newPos)
+  }, [canvasRef, getNodeAt, updateNodePosition])
 
   const onMouseUp = useCallback(() => {
     dragRef.current.active = false
-    const canvas = canvasRef.current
-    if (canvas) canvas.style.cursor = 'default'
+    if (canvasRef.current) canvasRef.current.style.cursor = 'default'
   }, [canvasRef])
 
   return { onMouseDown, onMouseMove, onMouseUp }
